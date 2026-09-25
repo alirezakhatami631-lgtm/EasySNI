@@ -1,0 +1,70 @@
+name: VPN Collector
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout EasySNI
+        uses: actions/checkout@v4
+
+      - name: Checkout MLMVPN
+        uses: actions/checkout@v4
+        with:
+          repository: alirezakhatami631-lgtm/mlmvpn_windows
+          path: mlmvpn_windows
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mlmvpn_windows/package-lock.json
+
+      - name: Install MLMVPN dependencies
+        working-directory: mlmvpn_windows
+        run: npm ci
+
+      - name: Collect and test configs
+        working-directory: mlmvpn_windows
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const fc = require('./free-configs');
+
+          (async () => {
+            const pool = await fc.loadPool('all');
+            const configs = Array.isArray(pool) ? pool : [];
+
+            fs.mkdirSync('../collector-output', { recursive: true });
+
+            fs.writeFileSync(
+              '../collector-output/vless.json',
+              JSON.stringify({
+                generated_at: new Date().toISOString(),
+                source: 'MLMVPN/free-configs',
+                count: configs.length,
+                configs
+              }, null, 2)
+            );
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Upload collector results
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-vless-configs
+          path: collector-output/
+          retention-days: 7
