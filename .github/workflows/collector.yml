@@ -6,65 +6,218 @@ on:
     - cron: "*/15 * * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   collect:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout EasySNI
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout MLMVPN
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: alirezakhatami631-lgtm/mlmvpn_windows
           path: mlmvpn_windows
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: mlmvpn_windows/package-lock.json
 
       - name: Install MLMVPN dependencies
         working-directory: mlmvpn_windows
+        shell: pwsh
         run: npm ci
 
-      - name: Collect and test configs
-        working-directory: mlmvpn_windows
+      - name: Install Xray Windows core
+        shell: pwsh
         run: |
-          node - <<'NODE'
+          $version = "26.9.9"
+          $url = "https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-windows-64.zip"
+          $zip = "$env:RUNNER_TEMP\xray.zip"
+          $core = "$env:GITHUB_WORKSPACE\mlmvpn_windows\core"
+
+          New-Item -ItemType Directory -Force -Path $core | Out-Null
+
+          Write-Host "Downloading Xray $version..."
+          Invoke-WebRequest -Uri $url -OutFile $zip
+
+          $expected = "eb73f7de6570c02dd0879a32995702e1a1991c4a397c2cfd70c63ac9c4eb0dc6"
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+
+          if ($actual -ne $expected) {
+            throw "Xray SHA256 mismatch. Expected $expected but got $actual"
+          }
+
+          Expand-Archive -Path $zip -DestinationPath $core -Force
+
+          if (-not (Test-Path "$core\xray.exe")) {
+            throw "xray.exe was not found after extraction."
+          }
+
+          & "$core\xray.exe" version
+
+      - name: Run real MLMVPN collector
+        working-directory: mlmvpn_windows
+        shell: bash
+        run: |
+          mkdir -p ../collector-output
+
+          node <<'NODE'
           const fs = require('fs');
           const fc = require('./free-configs');
 
-          (async () => {
-            const pool = await fc.loadPool('all');
-            const configs = Array.isArray(pool) ? pool : [];
+          const TARGET = 50;
 
-            fs.mkdirSync('../collector-output', { recursive: true });
+          (async () => {
+            const events = [];
+
+            const onEvent = (event) => {
+              events.push(event);
+
+              if (event.type === 'stage') {
+                console.log(
+                  `[STAGE] ${event.stage} total=${event.total} target=${event.target}`
+                );
+              }
+
+              if (event.type === 'progress') {
+                console.log(
+                  `[PROGRESS] stage=${event.stage}` +
+                  ` tested=${event.tested ?? 0}` +
+                  ` open=${event.open ?? 0}` +
+                  ` found=${event.found ?? 0}` +
+                  ` total=${event.total ?? 0}`
+                );
+              }
+
+              if (event.type === 'found') {
+                const n = event.node;
+                console.log(
+                  `[FOUND ${event.found}/${event.target}]` +
+                  ` ${n.protocol}://${n.host}:${n.port}` +
+                  ` delay=${n.delay}ms tcp=${n.tcp}ms`
+                );
+              }
+
+              if (event.type === 'batch-failed') {
+                console.warn(
+                  `[BATCH FAILED] size=${event.size} reason=${event.why || 'unknown'}`
+                );
+              }
+            };
+
+            console.log('Loading MLMVPN config pool...');
+            const pool = await fc.loadPool('all');
+
+            if (!Array.isArray(pool) || pool.length === 0) {
+              throw new Error('MLMVPN returned an empty usable config pool.');
+            }
+
+            console.log(`Usable unique configs: ${pool.length}`);
+
+            console.log(
+              `Starting REAL MLMVPN/Xray test. Target=${TARGET}`
+            );
+
+            const results = await fc.startJob({
+              poolId: 'all',
+              want: TARGET,
+              onEvent
+            });
+
+            if (!Array.isArray(results)) {
+              throw new Error('startJob() did not return an array.');
+            }
+
+            const successful = results
+              .filter(x =>
+                x &&
+                typeof x.uri === 'string' &&
+                x.uri.length > 0 &&
+                Number.isFinite(x.delay) &&
+                x.delay > 0
+              )
+              .sort((a, b) => a.delay - b.delay);
+
+            console.log(
+              `REAL successful proxy tests: ${successful.length}`
+            );
+
+            /*
+             * Only nodes that passed:
+             *   1. TCP connectivity
+             *   2. Xray startup/routing
+             *   3. Real HTTPS request through the proxy
+             *   4. Measured delay
+             *
+             * are written to vless.json.
+             */
+            const output = {
+              generated_at: new Date().toISOString(),
+              source: 'MLMVPN/free-configs.startJob',
+              pool: 'all',
+              target: TARGET,
+              count: successful.length,
+              verified_by: {
+                tcp: true,
+                xray: true,
+                real_https_request: true,
+                delay_ms: true
+              },
+              configs: successful
+            };
 
             fs.writeFileSync(
               '../collector-output/vless.json',
+              JSON.stringify(output, null, 2),
+              'utf8'
+            );
+
+            fs.writeFileSync(
+              '../collector-output/run-summary.json',
               JSON.stringify({
-                generated_at: new Date().toISOString(),
-                source: 'MLMVPN/free-configs',
-                count: configs.length,
-                configs
-              }, null, 2)
+                generated_at: output.generated_at,
+                target: TARGET,
+                pool_size: pool.length,
+                successful: successful.length,
+                stopped: successful.length < TARGET,
+                events
+              }, null, 2),
+              'utf8'
+            );
+
+            /*
+             * Do NOT turn "0 successful nodes" into a green result.
+             * A broken Xray/tester must never masquerade as an empty VPN pool.
+             */
+            if (successful.length === 0) {
+              throw new Error(
+                'No config passed the real TCP + Xray + HTTPS test.'
+              );
+            }
+
+            console.log(
+              `Collector finished: ${successful.length}/${TARGET} verified nodes.`
             );
           })().catch(error => {
-            console.error(error);
+            console.error('\nCOLLECTOR FAILED');
+            console.error(error && error.stack ? error.stack : error);
             process.exit(1);
           });
           NODE
 
-      - name: Upload collector results
+      - name: Upload verified results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tested-vless-configs
           path: collector-output/
+          if-no-files-found: error
           retention-days: 7
